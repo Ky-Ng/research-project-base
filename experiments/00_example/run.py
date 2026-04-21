@@ -2,8 +2,8 @@
 
 import os
 from dataclasses import asdict
-from allegro.example import Config, run
-from allegro.tracking import init_wandb
+from entrypoints.example import Config, run
+from entrypoints.tracking import init_wandb
 
 array_id = os.environ.get("SLURM_ARRAY_TASK_ID")  # None if not an array job
 
