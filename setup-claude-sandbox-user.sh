@@ -7,6 +7,7 @@
 # The account has:
 #   - no password (locked), no SSH login
 #   - zsh as its login shell
+#   - Oh My Zsh with a couple of community plugins
 #   - its own nvm + Node + Claude Code install
 #   - an alias `yolo` = `claude --dangerously-skip-permissions`
 #
@@ -29,6 +30,7 @@ set -euo pipefail
 USERNAME="${1:-claude-agent}"
 NODE_VERSION="${NODE_VERSION:-lts/*}"     # nvm spec, e.g. 20, 22, lts/*
 SHARED_GROUP="${SHARED_GROUP:-}"           # optional: existing group to add the user to
+OMZ_THEME="${OMZ_THEME:-robbyrussell}"     # any built-in OMZ theme
 
 # -------------------- sanity checks --------------------
 if [[ $EUID -ne 0 ]]; then
@@ -43,9 +45,10 @@ fi
 
 echo "==> Target username: $USERNAME"
 echo "==> Node version:    $NODE_VERSION"
+echo "==> OMZ theme:       $OMZ_THEME"
 [[ -n "$SHARED_GROUP" ]] && echo "==> Shared group:    $SHARED_GROUP"
 
-# -------------------- install zsh (and git, while we're here) --------------------
+# -------------------- install zsh / git / curl on the host --------------------
 install_pkgs() {
   local pkgs=("$@")
   if command -v apt-get >/dev/null 2>&1; then
@@ -127,25 +130,24 @@ if [[ -d /etc/ssh/sshd_config.d ]]; then
   fi
 fi
 
-# -------------------- install nvm + node + claude code as the new user --------------------
+# -------------------- provision the new user's environment --------------------
+# Everything below runs AS the new user.
 sudo -iu "$USERNAME" bash -s <<EOF
 set -euo pipefail
 
 export HOME="$USER_HOME"
 cd "\$HOME"
 
-# Install nvm if missing
+# ---- nvm ----
 if [[ ! -d "\$HOME/.nvm" ]]; then
   echo "  -> installing nvm..."
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 fi
 
-# Load nvm for this subshell
 export NVM_DIR="\$HOME/.nvm"
 # shellcheck disable=SC1091
 . "\$NVM_DIR/nvm.sh"
 
-# Install requested Node
 if ! nvm ls "$NODE_VERSION" >/dev/null 2>&1; then
   echo "  -> installing node ($NODE_VERSION)..."
   nvm install "$NODE_VERSION"
@@ -153,21 +155,51 @@ fi
 nvm use "$NODE_VERSION" >/dev/null
 nvm alias default "$NODE_VERSION" >/dev/null
 
-# Install Claude Code
+# ---- Claude Code ----
 if ! command -v claude >/dev/null 2>&1; then
   echo "  -> installing @anthropic-ai/claude-code..."
   npm install -g @anthropic-ai/claude-code
 fi
 
-# Minimal .zshrc so zsh-newuser-install never prompts
-touch "\$HOME/.zshrc"
+# ---- Oh My Zsh ----
+if [[ ! -d "\$HOME/.oh-my-zsh" ]]; then
+  echo "  -> installing oh-my-zsh..."
+  # RUNZSH=no   : don't drop into zsh at end of install
+  # CHSH=no     : we already set the login shell via useradd/chsh
+  # KEEP_ZSHRC=no: let OMZ write its template .zshrc (we'll customize it)
+  RUNZSH=no CHSH=no KEEP_ZSHRC=no \
+    sh -c "\$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+fi
 
-# Add our block only once
+# ---- Community plugins: zsh-autosuggestions, zsh-syntax-highlighting ----
+ZSH_CUSTOM="\$HOME/.oh-my-zsh/custom"
+if [[ ! -d "\$ZSH_CUSTOM/plugins/zsh-autosuggestions" ]]; then
+  echo "  -> installing zsh-autosuggestions..."
+  git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions \
+    "\$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+fi
+if [[ ! -d "\$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" ]]; then
+  echo "  -> installing zsh-syntax-highlighting..."
+  git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting.git \
+    "\$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+fi
+
+# ---- Configure OMZ template .zshrc: theme + plugins ----
+if [[ -f "\$HOME/.zshrc" ]]; then
+  # Set theme (escape slashes are not needed; no '/' in theme name)
+  sed -i "s|^ZSH_THEME=.*|ZSH_THEME=\"$OMZ_THEME\"|" "\$HOME/.zshrc"
+  # Enable useful plugins; note syntax-highlighting should be LAST per its docs
+  sed -i "s|^plugins=.*|plugins=(git command-not-found zsh-autosuggestions zsh-syntax-highlighting)|" \
+    "\$HOME/.zshrc"
+fi
+
+# ---- Append sandbox block (once) ----
+# This runs AFTER oh-my-zsh.sh sourcing, so we can override PROMPT.
 if ! grep -q '# >>> claude sandbox >>>' "\$HOME/.zshrc"; then
   cat >> "\$HOME/.zshrc" <<'RC'
 
 # >>> claude sandbox >>>
-# nvm
+# nvm (explicit; OMZ also ships an nvm plugin but this is more predictable)
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
 [ -s "\$NVM_DIR/bash_completion" ] && . "\$NVM_DIR/bash_completion"
@@ -175,19 +207,9 @@ export NVM_DIR="\$HOME/.nvm"
 # Claude Code convenience
 alias yolo='claude --dangerously-skip-permissions'
 
-# Prompt: yellow [claude-sandbox] tag + cwd
-autoload -U colors && colors
-setopt prompt_subst
-PROMPT='%F{yellow}[claude-sandbox]%f %~ %# '
-
-# History
-HISTFILE=\$HOME/.zsh_history
-HISTSIZE=10000
-SAVEHIST=10000
-setopt share_history hist_ignore_dups inc_append_history
-
-# Completion
-autoload -Uz compinit && compinit -i
+# Prepend a yellow [claude-sandbox] marker to whatever OMZ theme set up,
+# so we keep git-branch info etc. but always know we're in the sandbox.
+PROMPT='%F{yellow}[claude-sandbox]%f '\$PROMPT
 
 # Editor
 export EDITOR="\${EDITOR:-vi}"
@@ -195,12 +217,12 @@ export EDITOR="\${EDITOR:-vi}"
 RC
 fi
 
-# Reasonable git defaults for a throwaway sandbox
+# ---- Reasonable git defaults for a throwaway sandbox ----
 git config --global init.defaultBranch main
 git config --global pull.rebase false
 git config --global credential.helper store
 
-# Workspace dir
+# ---- Workspace ----
 mkdir -p "\$HOME/workspace"
 
 echo "  -> done as user $USERNAME."
@@ -212,15 +234,19 @@ INSTRUCTIONS_FILE="instructions-${USERNAME}.txt"
 cat > "$INSTRUCTIONS_FILE" <<MSG
 ==========================================================
  Sandbox user '$USERNAME' is ready.
- Shell: $ZSH_PATH
- Home:  $USER_HOME
+ Shell:     $ZSH_PATH  (with Oh My Zsh)
+ Home:      $USER_HOME
+ OMZ theme: $OMZ_THEME
+ OMZ plugins: git, command-not-found,
+              zsh-autosuggestions, zsh-syntax-highlighting
 ==========================================================
 
 ENTER THE SANDBOX
 -----------------
     sudo -iu $USERNAME
 
-    # you are now in zsh, prompt shows [claude-sandbox]
+    # You'll land in zsh with Oh My Zsh loaded.
+    # Prompt shows [claude-sandbox] before the usual OMZ prompt.
     cd ~/workspace
     yolo                 # = claude --dangerously-skip-permissions
 
@@ -265,6 +291,13 @@ B) No creds in the sandbox; exfiltrate the diff and push from a trusted box:
 
 C) Work against a throwaway fork, PAT scoped to the fork only.
    Agent pushes to the fork; you open the PR manually from the fork.
+
+
+CUSTOMIZING OMZ FURTHER
+-----------------------
+Edit ~/.zshrc inside the sandbox. The "# >>> claude sandbox >>>" block at
+the bottom is safe to keep as-is. To change the theme, edit ZSH_THEME near
+the top. To add plugins, append to the plugins=(...) list.
 
 
 TEARDOWN
