@@ -4,19 +4,26 @@
 #
 # Creates an unprivileged Linux user intended to run
 # `claude --dangerously-skip-permissions` in a blast-radius-limited way.
+#
 # The account has:
-#   - no password (locked), no SSH login
+#   - no password (inactive, but account is active; SSH key auth works)
+#   - SSH key access copied from the invoking user (or root as fallback)
 #   - zsh as its login shell
 #   - Oh My Zsh with a couple of community plugins
 #   - its own nvm + Node + Claude Code install
 #   - an alias `yolo` = `claude --dangerously-skip-permissions`
+#
+# Rationale: this is sized for ephemeral GPU instances (Vast / RunPod / Lambda)
+# where the whole box is already disposable, and you want VS Code Remote-SSH /
+# the Claude Code extension to connect as the sandbox user so that
+# `--dangerously-skip-permissions` (which refuses to run as root) works.
 #
 # Usage:
 #   sudo ./setup-claude-sandbox-user.sh [username]
 #
 # Default username is "claude-agent".
 #
-# After running, enter the sandbox with:
+# After running, SSH in as that user directly, or from the same host:
 #   sudo -iu <username>
 # then:
 #   yolo
@@ -93,10 +100,16 @@ if id "$USERNAME" >/dev/null 2>&1; then
     chsh -s "$ZSH_PATH" "$USERNAME"
     echo "==> Changed login shell of '$USERNAME' to $ZSH_PATH."
   fi
+  # Ensure password state is "no valid password but account active"
+  # so SSH key auth works even if a previous run used `passwd -l`.
+  usermod -p '*' "$USERNAME"
 else
   useradd --create-home --shell "$ZSH_PATH" "$USERNAME"
-  passwd -l "$USERNAME" >/dev/null
-  echo "==> Created user '$USERNAME' with shell $ZSH_PATH and locked password."
+  # Disable password login but keep account active so SSH key auth works.
+  # `passwd -l` prepends '!' to the hash, which some sshd configs reject
+  # even for key-based auth; '*' is the safe "invalid password" marker.
+  usermod -p '*' "$USERNAME"
+  echo "==> Created user '$USERNAME' with shell $ZSH_PATH (no password, keys only)."
 fi
 
 USER_HOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
@@ -115,23 +128,57 @@ if [[ -n "$SHARED_GROUP" ]]; then
   fi
 fi
 
-# -------------------- deny SSH explicitly --------------------
+# -------------------- clean up any legacy SSH-deny drop-in --------------------
+# Previous versions of this script wrote a DenyUsers drop-in. Remove it so
+# this user is reachable over SSH.
 SSHD_DROPIN="/etc/ssh/sshd_config.d/99-deny-${USERNAME}.conf"
-if [[ -d /etc/ssh/sshd_config.d ]]; then
-  if [[ ! -f "$SSHD_DROPIN" ]]; then
-    echo "DenyUsers $USERNAME" > "$SSHD_DROPIN"
-    chmod 644 "$SSHD_DROPIN"
-    echo "==> Wrote $SSHD_DROPIN (denies SSH for $USERNAME)."
-    if systemctl is-active --quiet ssh 2>/dev/null; then
-      systemctl reload ssh || true
-    elif systemctl is-active --quiet sshd 2>/dev/null; then
-      systemctl reload sshd || true
-    fi
+if [[ -f "$SSHD_DROPIN" ]]; then
+  rm -f "$SSHD_DROPIN"
+  echo "==> Removed legacy SSH deny drop-in at $SSHD_DROPIN."
+  if systemctl is-active --quiet ssh 2>/dev/null; then
+    systemctl reload ssh || true
+  elif systemctl is-active --quiet sshd 2>/dev/null; then
+    systemctl reload sshd || true
   fi
 fi
 
+# -------------------- SSH: install authorized_keys for this user --------------------
+AUTHKEYS_SRC=""
+if [[ -n "${SUDO_USER:-}" ]] && id "$SUDO_USER" >/dev/null 2>&1; then
+  sudo_user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  if [[ -n "$sudo_user_home" && -f "$sudo_user_home/.ssh/authorized_keys" ]]; then
+    AUTHKEYS_SRC="$sudo_user_home/.ssh/authorized_keys"
+  fi
+fi
+# Fall back to root's keys (typical on Vast / RunPod where you log in as root)
+if [[ -z "$AUTHKEYS_SRC" && -f "/root/.ssh/authorized_keys" ]]; then
+  AUTHKEYS_SRC="/root/.ssh/authorized_keys"
+fi
+
+USER_SSH_DIR="$USER_HOME/.ssh"
+mkdir -p "$USER_SSH_DIR"
+chmod 700 "$USER_SSH_DIR"
+touch "$USER_SSH_DIR/authorized_keys"
+
+if [[ -n "$AUTHKEYS_SRC" ]]; then
+  # Merge + dedupe so re-runs are idempotent and don't drop keys the user
+  # may have added by hand.
+  cat "$AUTHKEYS_SRC" "$USER_SSH_DIR/authorized_keys" \
+    | awk 'NF && !/^#/ && !seen[$0]++' \
+    > "$USER_SSH_DIR/authorized_keys.new"
+  mv "$USER_SSH_DIR/authorized_keys.new" "$USER_SSH_DIR/authorized_keys"
+  key_count="$(wc -l < "$USER_SSH_DIR/authorized_keys")"
+  echo "==> Installed $key_count SSH key(s) from $AUTHKEYS_SRC"
+else
+  echo "WARN: no authorized_keys source found on this host." >&2
+  echo "      Add your public key manually:" >&2
+  echo "        echo 'ssh-ed25519 AAAA... you@laptop' >> $USER_SSH_DIR/authorized_keys" >&2
+fi
+
+chmod 600 "$USER_SSH_DIR/authorized_keys"
+chown -R "${USERNAME}:${USERNAME}" "$USER_SSH_DIR"
+
 # -------------------- provision the new user's environment --------------------
-# Everything below runs AS the new user.
 sudo -iu "$USERNAME" bash -s <<EOF
 set -euo pipefail
 
@@ -164,14 +211,11 @@ fi
 # ---- Oh My Zsh ----
 if [[ ! -d "\$HOME/.oh-my-zsh" ]]; then
   echo "  -> installing oh-my-zsh..."
-  # RUNZSH=no   : don't drop into zsh at end of install
-  # CHSH=no     : we already set the login shell via useradd/chsh
-  # KEEP_ZSHRC=no: let OMZ write its template .zshrc (we'll customize it)
   RUNZSH=no CHSH=no KEEP_ZSHRC=no \
     sh -c "\$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 fi
 
-# ---- Community plugins: zsh-autosuggestions, zsh-syntax-highlighting ----
+# ---- Community plugins ----
 ZSH_CUSTOM="\$HOME/.oh-my-zsh/custom"
 if [[ ! -d "\$ZSH_CUSTOM/plugins/zsh-autosuggestions" ]]; then
   echo "  -> installing zsh-autosuggestions..."
@@ -184,22 +228,19 @@ if [[ ! -d "\$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" ]]; then
     "\$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
 fi
 
-# ---- Configure OMZ template .zshrc: theme + plugins ----
+# ---- OMZ template .zshrc: theme + plugins ----
 if [[ -f "\$HOME/.zshrc" ]]; then
-  # Set theme (escape slashes are not needed; no '/' in theme name)
   sed -i "s|^ZSH_THEME=.*|ZSH_THEME=\"$OMZ_THEME\"|" "\$HOME/.zshrc"
-  # Enable useful plugins; note syntax-highlighting should be LAST per its docs
   sed -i "s|^plugins=.*|plugins=(git command-not-found zsh-autosuggestions zsh-syntax-highlighting)|" \
     "\$HOME/.zshrc"
 fi
 
-# ---- Append sandbox block (once) ----
-# This runs AFTER oh-my-zsh.sh sourcing, so we can override PROMPT.
+# ---- Sandbox block (once) ----
 if ! grep -q '# >>> claude sandbox >>>' "\$HOME/.zshrc"; then
   cat >> "\$HOME/.zshrc" <<'RC'
 
 # >>> claude sandbox >>>
-# nvm (explicit; OMZ also ships an nvm plugin but this is more predictable)
+# nvm
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
 [ -s "\$NVM_DIR/bash_completion" ] && . "\$NVM_DIR/bash_completion"
@@ -217,7 +258,7 @@ export EDITOR="\${EDITOR:-vi}"
 RC
 fi
 
-# ---- Reasonable git defaults for a throwaway sandbox ----
+# ---- Git defaults for a throwaway sandbox ----
 git config --global init.defaultBranch main
 git config --global pull.rebase false
 git config --global credential.helper store
@@ -231,30 +272,70 @@ EOF
 # -------------------- write instructions file --------------------
 INSTRUCTIONS_FILE="instructions-${USERNAME}.txt"
 
+# Build a human-readable key summary for the instructions
+if [[ -s "$USER_SSH_DIR/authorized_keys" ]]; then
+  KEY_SUMMARY="$(awk '{print "      - " $3 " (" $1 ")"}' "$USER_SSH_DIR/authorized_keys")"
+else
+  KEY_SUMMARY="      (none installed -- add one before you can SSH in)"
+fi
+
 cat > "$INSTRUCTIONS_FILE" <<MSG
 ==========================================================
  Sandbox user '$USERNAME' is ready.
- Shell:     $ZSH_PATH  (with Oh My Zsh)
- Home:      $USER_HOME
- OMZ theme: $OMZ_THEME
+ Shell:       $ZSH_PATH  (with Oh My Zsh)
+ Home:        $USER_HOME
+ OMZ theme:   $OMZ_THEME
  OMZ plugins: git, command-not-found,
               zsh-autosuggestions, zsh-syntax-highlighting
+ SSH keys authorized for '$USERNAME':
+$KEY_SUMMARY
 ==========================================================
 
-ENTER THE SANDBOX
------------------
+CONNECT VIA SSH
+---------------
+Add this to your LAPTOP's ~/.ssh/config:
+
+    Host sandbox
+        HostName <ip-or-hostname-of-this-machine>
+        Port    <ssh-port>
+        User    $USERNAME
+        IdentityFile ~/.ssh/id_ed25519   # or whichever key you use
+
+Then, from your laptop:
+
+    ssh sandbox
+
+Or, if you're already on this machine as root/another user:
+
     sudo -iu $USERNAME
 
-    # You'll land in zsh with Oh My Zsh loaded.
-    # Prompt shows [claude-sandbox] before the usual OMZ prompt.
+
+VS CODE REMOTE-SSH
+------------------
+Use the same 'Host sandbox' entry. Because the SSH session lands as
+'$USERNAME' (not root), any 'claude' process the VS Code extension
+spawns will run as '$USERNAME' too -- which is required for
+--dangerously-skip-permissions (Claude Code refuses to run as root).
+
+Then in VS Code Settings, search "claude code" and:
+  - check   "Allow dangerously skip permissions"
+  - set     "Initial Permission Mode" = bypassPermissions
+  - reload  window (Ctrl/Cmd+Shift+P -> "Developer: Reload Window")
+
+After reload, click the mode indicator at the bottom of the Claude
+prompt box and pick "Bypass permissions".
+
+
+USE CLAUDE CODE IN THE TERMINAL
+-------------------------------
+Once you're in as $USERNAME (via SSH or sudo -iu):
+
     cd ~/workspace
     yolo                 # = claude --dangerously-skip-permissions
 
 
 CLONE A REPO AND COMMIT
 -----------------------
-Inside the sandbox:
-
     git config --global user.name  "Your Name"
     git config --global user.email "you@example.com"
     git clone https://github.com/<you>/<repo>.git
@@ -266,56 +347,43 @@ Inside the sandbox:
 
 PUSHING YOUR CHANGES (three options)
 ------------------------------------
-A) Fine-grained PAT, scoped to one repo, short TTL (24h):
-   On GitHub -> Settings -> Developer settings -> Fine-grained tokens.
-   Repository access: just the repo you're touching.
-   Permissions: Contents: Read and write.
-   Expiration: 1 day.
+A) Fine-grained PAT, scoped to one repo, 24h TTL:
+   GitHub -> Settings -> Developer settings -> Fine-grained tokens.
+   Repository access: just the repo. Contents: Read and write. Exp: 1 day.
 
        git push -u origin experiment/<branch-name>
-       # first push prompts for user + token; credential.helper store caches it.
 
-   When done with the session: revoke the PAT on GitHub.
+   When done: revoke the PAT.
 
-B) No creds in the sandbox; exfiltrate the diff and push from a trusted box:
+B) No creds in the sandbox; exfiltrate a git bundle:
 
        # in the sandbox:
-       git bundle create /tmp/changes.bundle origin/main..experiment/<branch-name>
+       git bundle create /tmp/changes.bundle origin/main..experiment/<branch>
 
        # on your laptop:
-       scp user@gpu-host:/tmp/changes.bundle .
-       git fetch ./changes.bundle experiment/<branch-name>:experiment/<branch-name>
-       git push origin experiment/<branch-name>
+       scp sandbox:/tmp/changes.bundle .
+       git fetch ./changes.bundle experiment/<branch>:experiment/<branch>
+       git push origin experiment/<branch>
 
-   Bundles preserve commit SHAs exactly -- useful for reproducibility.
-
-C) Work against a throwaway fork, PAT scoped to the fork only.
-   Agent pushes to the fork; you open the PR manually from the fork.
-
-
-CUSTOMIZING OMZ FURTHER
------------------------
-Edit ~/.zshrc inside the sandbox. The "# >>> claude sandbox >>>" block at
-the bottom is safe to keep as-is. To change the theme, edit ZSH_THEME near
-the top. To add plugins, append to the plugins=(...) list.
+C) Push to a throwaway fork with a fork-scoped PAT; open the PR manually.
 
 
 TEARDOWN
 --------
     sudo userdel -r $USERNAME
-    sudo rm -f $SSHD_DROPIN
 
 
 NOTES ON ISOLATION
 ------------------
-- This is a UID-level sandbox, not a VM or container.
-- The sandbox user can still reach the local network and use any outbound
-  HTTP. If that matters, use a VM or container instead / in addition.
-- Anything in this user's home is readable by the agent. Treat any credential
+- This is a UID-level sandbox, not a VM or container. It's sized for
+  ephemeral GPU instances (Vast / RunPod / Lambda) where the whole
+  machine is already disposable.
+- On a machine you care about, remember: the sandbox user shares the
+  kernel, the local network, and outbound internet with everything else.
+- Anything in ~/$USERNAME is readable by the agent. Treat any credential
   you drop in here as burnable.
 MSG
 
-# Chown the instructions file back to the invoking user, if applicable.
 if [[ -n "${SUDO_USER:-}" ]] && id "$SUDO_USER" >/dev/null 2>&1; then
   chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$INSTRUCTIONS_FILE"
 fi
